@@ -191,6 +191,9 @@ enable-export = Applica questo tema alle app GNOME.
 icon-theme = Tema icone
     .desc = Applica icone differenti alle applicazioni.
 
+cursor-theme = Tema cursore
+    .desc = Applica un tema cursore differente.
+
 text-tint = Tinta per il testo dell'interfaccia
     .desc = Colore su cui si basano i colori del testo con sufficiente contrasto in diverse superfici.
 

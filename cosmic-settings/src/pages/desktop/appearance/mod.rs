@@ -55,6 +55,7 @@ crate::cache_dynamic_lazy! {
     static RGB: String = fl!("rgb");
     static RESET_TO_DEFAULT: String = fl!("reset-to-default");
     static ICON_THEME: String = fl!("icon-theme");
+    static CURSOR_THEME: String = fl!("cursor-theme");
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +75,8 @@ pub struct IconTheme {
     id: String,
     // GTK uses the name of the theme as specified in its index file
     name: String,
+    // Whether the theme includes a cursor theme
+    cursor: bool,
 }
 
 pub struct Page {
@@ -91,6 +94,9 @@ pub struct Page {
     icon_theme_active: Option<usize>,
     icon_themes: IconThemes,
     icon_handles: IconHandles,
+
+    cursor_theme_active: Option<usize>,
+    cursor_themes: IconThemes,
 
     font_config: font_config::Model,
 
@@ -213,6 +219,8 @@ impl
             icon_theme_active: None,
             icon_themes: Vec::new(),
             icon_handles: Vec::new(),
+            cursor_theme_active: None,
+            cursor_themes: Vec::new(),
             theme,
             theme_mode_config,
             theme_builder_config,
@@ -288,6 +296,7 @@ pub enum Message {
     FontConfig(font_config::Message),
     GapSize(spin_button::Message),
     IconTheme(usize),
+    CursorTheme(usize),
     ImportError,
     ImportFile(Arc<SelectedFiles>),
     ImportSuccess(Box<ThemeBuilder>),
@@ -368,7 +377,8 @@ impl From<CornerRadii> for Roundness {
 
 impl Page {
     fn experimental_context_view(&self) -> Element<'_, crate::pages::Message> {
-        let active = self.icon_theme_active;
+        let active_icon_theme = self.icon_theme_active;
+        let active_cursor_theme = self.cursor_theme_active;
         let theme = cosmic::theme::active();
         let theme = theme.cosmic();
         cosmic::iced::widget::column![
@@ -390,7 +400,7 @@ impl Page {
                         .zip(self.icon_handles.iter())
                         .enumerate()
                         .map(|(i, (theme, handles))| {
-                            let selected = active.map(|j| i == j).unwrap_or_default();
+                            let selected = active_icon_theme.is_some_and(|j| i == j);
                             icon_theme_button(&theme.name, handles, i, selected)
                         })
                         .collect(),
@@ -399,7 +409,25 @@ impl Page {
                 .column_spacing(theme.space_xs())
                 .into()
             ])
-            .spacing(theme.space_xxs())
+            .spacing(theme.space_xxs()),
+            // Cursor theme previews
+            cosmic::widget::column::with_children(vec![
+                text::heading(&*CURSOR_THEME).into(),
+                flex_row(
+                    self.cursor_themes
+                        .iter()
+                        .zip(self.icon_handles.iter())
+                        .enumerate()
+                        .map(|(i, (theme, handles))| {
+                            let selected = active_cursor_theme.is_some_and(|j| i == j);
+                            cursor_theme_button(&theme.name, handles, i, selected)
+                        })
+                        .collect(),
+                )
+                .row_spacing(theme.space_xs())
+                .column_spacing(theme.space_xs())
+                .into()
+            ])
         ]
         .spacing(theme.space_m())
         .width(Length::Fill)
@@ -470,6 +498,18 @@ impl Page {
                     }
 
                     tokio::spawn(set_gnome_icon_theme(theme.name));
+                }
+            }
+
+            Message::CursorTheme(id) => {
+                if let Some(theme) = self.cursor_themes.get(id).cloned() {
+                    self.cursor_theme_active = Some(id);
+
+                    if let Some(ref config) = self.tk_config {
+                        _ = config.set::<String>("cursor-theme", theme.id);
+                    }
+
+                    tokio::spawn(set_gnome_cursor_theme(theme.name));
                 }
             }
 
@@ -702,14 +742,26 @@ impl Page {
 
             Message::Entered((icon_themes, icon_handles)) => {
                 let active_icon_theme = cosmic::config::icon_theme();
+                let active_cursor_theme = cosmic::config::cursor_theme();
 
                 // Set the icon themes, and define the active icon theme.
                 self.icon_themes = icon_themes;
                 self.icon_theme_active = self
                     .icon_themes
                     .iter()
-                    .position(|theme| &theme.id == &active_icon_theme);
+                    .position(|theme| theme.id == active_icon_theme);
                 self.icon_handles = icon_handles;
+
+                // Set the cursor themes, and define the active cursor theme.
+                self.cursor_themes = icon_themes
+                    .iter()
+                    .filter(|theme| theme.cursor)
+                    .cloned()
+                    .collect();
+                self.cursor_theme_active = self
+                    .cursor_themes
+                    .iter()
+                    .position(|theme| theme.id == active_cursor_theme);
             }
 
             Message::Left => {
@@ -1979,6 +2031,8 @@ async fn fetch_icon_themes() -> Message {
                 continue;
             };
 
+            let cursor = path.join("cursors").exists();
+
             buffer.clear();
             let mut name = None;
             let mut valid_dirs = Vec::new();
@@ -2032,7 +2086,7 @@ async fn fetch_icon_themes() -> Message {
                 if let Ok(handles) =
                     tokio::task::spawn_blocking(|| preview_handles(theme, valid_dirs)).await
                 {
-                    icon_themes.insert(IconTheme { id, name }, handles);
+                    icon_themes.insert(IconTheme { id, name, cursor }, handles);
                 }
             }
         }
@@ -2048,6 +2102,19 @@ async fn set_gnome_icon_theme(theme: String) {
             "set",
             "org.gnome.desktop.interface",
             "icon-theme",
+            theme.as_str(),
+        ])
+        .status()
+        .await;
+}
+
+/// Set the preferred cursor theme for GNOME/GTK applications.
+async fn set_gnome_cursor_theme(theme: String) {
+    let _res = tokio::process::Command::new("gsettings")
+        .args([
+            "set",
+            "org.gnome.desktop.interface",
+            "cursor-theme",
             theme.as_str(),
         ])
         .status()
@@ -2170,6 +2237,104 @@ fn icon_theme_button(
                 None,
             )
             .on_press(Message::IconTheme(id))
+            .selected(selected)
+            .padding([theme.space_xs(), theme.space_xs() + 1])
+            // Image button's style mostly works, but it needs a background to fit the design
+            .style(button::Style::Custom {
+                active: Box::new(move |focused, theme| {
+                    let mut appearance = <cosmic::theme::Theme as button::StyleSheet>::active(
+                        theme,
+                        focused,
+                        selected,
+                        &cosmic::theme::Button::Image,
+                    );
+                    appearance.background = Some(background);
+                    appearance
+                }),
+                disabled: Box::new(move |theme| {
+                    let mut appearance = <cosmic::theme::Theme as button::StyleSheet>::disabled(
+                        theme,
+                        &cosmic::theme::Button::Image,
+                    );
+                    appearance.background = Some(background);
+                    appearance
+                }),
+                hovered: Box::new(move |focused, theme| {
+                    let mut appearance = <cosmic::theme::Theme as button::StyleSheet>::hovered(
+                        theme,
+                        focused,
+                        selected,
+                        &cosmic::theme::Button::Image,
+                    );
+                    appearance.background = Some(background);
+                    appearance
+                }),
+                pressed: Box::new(move |focused, theme| {
+                    let mut appearance = <cosmic::theme::Theme as button::StyleSheet>::pressed(
+                        theme,
+                        focused,
+                        selected,
+                        &cosmic::theme::Button::Image,
+                    );
+                    appearance.background = Some(background);
+                    appearance
+                }),
+            }),
+        )
+        .push(
+            text::body(if name.len() > ICON_NAME_TRUNC {
+                format!("{name:.ICON_NAME_TRUNC$}...")
+            } else {
+                name.into()
+            })
+            .width(Length::Fixed((ICON_THUMB_SIZE * 3) as _)),
+        )
+        .spacing(theme.space_xxs())
+        .into()
+}
+
+/// Cursor theme button with a preview of the cursor theme.
+fn cursor_theme_button(
+    name: &str,
+    handles: &[icon::Handle],
+    id: usize,
+    selected: bool,
+) -> Element<'static, Message> {
+    let theme = cosmic::theme::active();
+    let theme = theme.cosmic();
+    let background = Background::Color(theme.palette.neutral_4.into());
+
+    cosmic::widget::column()
+        .push(
+            cosmic::widget::button::custom_image_button(
+                cosmic::widget::column::with_children(vec![
+                    cosmic::widget::row()
+                        .extend(
+                            handles
+                                .iter()
+                                .take(ICON_PREV_ROW)
+                                .cloned()
+                                // TODO: Maybe allow choosable sizes/zooming
+                                .map(|handle| handle.icon().size(ICON_THUMB_SIZE)),
+                        )
+                        .spacing(theme.space_xxxs())
+                        .into(),
+                    cosmic::widget::row()
+                        .extend(
+                            handles
+                                .iter()
+                                .skip(ICON_PREV_ROW)
+                                .cloned()
+                                // TODO: Maybe allow choosable sizes/zooming
+                                .map(|handle| handle.icon().size(ICON_THUMB_SIZE)),
+                        )
+                        .spacing(theme.space_xxxs())
+                        .into(),
+                ])
+                .spacing(theme.space_xxxs()),
+                None,
+            )
+            .on_press(Message::CursorTheme(id))
             .selected(selected)
             .padding([theme.space_xs(), theme.space_xs() + 1])
             // Image button's style mostly works, but it needs a background to fit the design
