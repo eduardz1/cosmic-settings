@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 pub mod font_config;
+pub mod icon_themes;
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
@@ -13,42 +12,31 @@ use cosmic::config::CosmicTk;
 use cosmic::cosmic_config::{Config, ConfigSet, CosmicConfigEntry};
 use cosmic::cosmic_theme::palette::{FromColor, Hsv, Srgb, Srgba};
 use cosmic::cosmic_theme::{
-    CornerRadii, Density, Theme, ThemeBuilder, ThemeMode, DARK_THEME_BUILDER_ID,
+    CornerRadii, Density, Spacing, Theme, ThemeBuilder, ThemeMode, DARK_THEME_BUILDER_ID,
     LIGHT_THEME_BUILDER_ID,
 };
-use cosmic::iced_core::{alignment, Background, Color, Length};
+use cosmic::iced_core::{alignment, Color, Length};
 use cosmic::iced_widget::scrollable;
-use cosmic::prelude::CollectionWidget;
-use cosmic::widget::icon::{self, from_name, icon};
+use cosmic::widget::icon::{from_name, icon};
 use cosmic::widget::{
     button, color_picker::ColorPickerUpdate, container, flex_row, horizontal_space, radio, row,
     settings, spin_button, text, ColorPickerModel,
 };
-use cosmic::Apply;
-use cosmic::{command, Command, Element};
+use cosmic::{command, Apply, Command, Element};
 use cosmic_panel_config::CosmicPanelConfig;
 use cosmic_settings_page::Section;
 use cosmic_settings_page::{self as page, section};
 use cosmic_settings_wallpaper as wallpaper;
+use icon_themes::{IconHandles, IconThemes};
 use ron::ser::PrettyConfig;
 use serde::Serialize;
 use slab::Slab;
 use slotmap::SlotMap;
-use tokio::io::AsyncBufReadExt;
 
 use crate::app;
 use crate::widget::color_picker_context_view;
 
 use super::wallpaper::widgets::color_image;
-
-const ICON_PREV_N: usize = 6;
-const ICON_PREV_ROW: usize = 3;
-const ICON_TRY_SIZES: [u16; 3] = [32, 48, 64];
-const ICON_THUMB_SIZE: u16 = 32;
-const ICON_NAME_TRUNC: usize = 20;
-
-pub type IconThemes = Vec<IconTheme>;
-pub type IconHandles = Vec<[icon::Handle; ICON_PREV_N]>;
 
 crate::cache_dynamic_lazy! {
     static HEX: String = fl!("hex");
@@ -65,18 +53,10 @@ enum ContextView {
     ContainerBackground,
     ControlComponent,
     CustomAccent,
-    Experimental,
+    IconsAndToolkit,
     InterfaceText,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct IconTheme {
-    // COSMIC uses the file name of the folder containing the theme
-    id: String,
-    // GTK uses the name of the theme as specified in its index file
-    name: String,
-    // Whether the theme includes a cursor theme
-    cursor: bool,
+    MonospaceFont,
+    SystemFont,
 }
 
 pub struct Page {
@@ -90,6 +70,10 @@ pub struct Page {
     interface_text: ColorPickerModel,
     control_component: ColorPickerModel,
     roundness: Roundness,
+
+    font_config: font_config::Model,
+    font_filter: Vec<Arc<str>>,
+    font_search: String,
 
     icon_theme_active: Option<usize>,
     icon_themes: IconThemes,
@@ -216,6 +200,8 @@ impl
             ),
             no_custom_window_hint: theme_builder.window_hint.is_none(),
             font_config: font_config::Model::new(),
+            font_filter: Vec::new(),
+            font_search: String::new(),
             icon_theme_active: None,
             icon_themes: Vec::new(),
             icon_handles: Vec::new(),
@@ -288,12 +274,16 @@ pub enum Message {
     CustomAccent(ColorPickerUpdate),
     DarkMode(bool),
     Density(Density),
+    DisplayMonoFont,
+    DisplaySystemFont,
     Entered((IconThemes, IconHandles)),
-    ExperimentalContextDrawer,
+    IconsAndToolkit,
     ExportError,
     ExportFile(Arc<SelectedFiles>),
     ExportSuccess,
     FontConfig(font_config::Message),
+    FontSearch(String),
+    FontSelect(bool, Arc<str>),
     GapSize(spin_button::Message),
     IconTheme(usize),
     CursorTheme(usize),
@@ -376,7 +366,7 @@ impl From<CornerRadii> for Roundness {
 }
 
 impl Page {
-    fn experimental_context_view(&self) -> Element<'_, crate::pages::Message> {
+    fn icons_and_toolkit(&self) -> Element<'_, crate::pages::Message> {
         let active_icon_theme = self.icon_theme_active;
         let active_cursor_theme = self.cursor_theme_active;
         let theme = cosmic::theme::active();
@@ -401,7 +391,7 @@ impl Page {
                         .enumerate()
                         .map(|(i, (theme, handles))| {
                             let selected = active_icon_theme.is_some_and(|j| i == j);
-                            icon_theme_button(&theme.name, handles, i, selected)
+                            icon_themes::button(&theme.name, handles, i, selected)
                         })
                         .collect(),
                 )
@@ -443,6 +433,77 @@ impl Page {
         let mut needs_sync = false;
 
         match message {
+            Message::DisplayMonoFont => {
+                self.context_view = Some(ContextView::MonospaceFont);
+                self.font_search.clear();
+
+                return cosmic::command::message(crate::app::Message::OpenContextDrawer(
+                    fl!("monospace-font").into(),
+                ));
+            }
+
+            Message::DisplaySystemFont => {
+                self.context_view = Some(ContextView::SystemFont);
+                self.font_search.clear();
+
+                return cosmic::command::message(crate::app::Message::OpenContextDrawer(
+                    fl!("interface-font").into(),
+                ));
+            }
+
+            Message::FontConfig(message) => {
+                return self.font_config.update(message);
+            }
+
+            Message::FontSearch(input) => {
+                self.font_search = input.to_lowercase();
+                self.font_filter.clear();
+
+                match self.context_view {
+                    Some(ContextView::SystemFont) => {
+                        self.font_config
+                            .interface_font_families
+                            .iter()
+                            .filter(|f| f.to_lowercase().contains(&self.font_search))
+                            .for_each(|f| self.font_filter.push(f.clone()));
+                    }
+
+                    Some(ContextView::MonospaceFont) => {
+                        self.font_config
+                            .monospace_font_families
+                            .iter()
+                            .filter(|f| f.to_lowercase().contains(&self.font_search))
+                            .for_each(|f| self.font_filter.push(f.clone()));
+                    }
+
+                    _ => (),
+                }
+            }
+
+            Message::FontSelect(is_system, family) => {
+                if is_system {
+                    if let Some(id) = self
+                        .font_config
+                        .interface_font_families
+                        .iter()
+                        .position(|f| f == &family)
+                    {
+                        return self
+                            .font_config
+                            .update(font_config::Message::InterfaceFontFamily(id));
+                    }
+                } else if let Some(id) = self
+                    .font_config
+                    .monospace_font_families
+                    .iter()
+                    .position(|f| f == &family)
+                {
+                    return self
+                        .font_config
+                        .update(font_config::Message::MonospaceFontFamily(id));
+                }
+            }
+
             Message::NewTheme(theme) => {
                 self.theme = theme;
             }
@@ -494,10 +555,22 @@ impl Page {
                     self.icon_theme_active = Some(id);
 
                     if let Some(ref config) = self.tk_config {
-                        _ = config.set::<String>("icon-theme", theme.id);
+                        _ = config.set::<String>("icon_theme", theme.id);
                     }
 
-                    tokio::spawn(set_gnome_icon_theme(theme.name));
+                    tokio::spawn(icon_themes::set_gnome_icon_theme(theme.name));
+                }
+            }
+
+            Message::CursorTheme(id) => {
+                if let Some(theme) = self.cursor_themes.get(id).cloned() {
+                    self.cursor_theme_active = Some(id);
+
+                    if let Some(ref config) = self.tk_config {
+                        _ = config.set::<String>("cursor-theme", theme.id);
+                    }
+
+                    tokio::spawn(set_gnome_cursor_theme(theme.name))
                 }
             }
 
@@ -721,18 +794,17 @@ impl Page {
                     _ = config.set("header_size", density);
                 }
 
-                let Some(config) = self.theme_builder_config.as_ref() else {
-                    return Command::none();
-                };
+                let spacing: Spacing = density.into();
 
-                let spacing = density.into();
+                let light_config = Theme::light_config().ok();
+                let dark_config = Theme::dark_config().ok();
 
-                if self
-                    .theme_builder
-                    .set_spacing(config, spacing)
-                    .unwrap_or_default()
-                {
-                    self.theme_config_write("spacing", spacing);
+                // Update both light and dark theme configs
+                if let Some(config) = light_config {
+                    _ = config.set("spacing", spacing);
+                }
+                if let Some(config) = dark_config {
+                    _ = config.set("spacing", spacing);
                 }
 
                 tokio::task::spawn(async move {
@@ -820,6 +892,10 @@ impl Page {
                 if let Some(config) = self.theme_builder_config.as_ref() {
                     _ = self.theme_builder.write_entry(config);
                 };
+                if let Some(config) = self.tk_config.as_mut() {
+                    _ = config.set("interface_density", Density::Standard);
+                    _ = config.set("header_size", Density::Standard);
+                }
 
                 let config = if self.theme_mode.is_dark {
                     Theme::dark_config()
@@ -836,6 +912,7 @@ impl Page {
                 let r = self.roundness;
                 tokio::task::spawn(async move {
                     Self::update_panel_radii(r);
+                    Self::update_panel_spacing(Density::Standard);
                 });
 
                 self.reload_theme_mode();
@@ -1031,18 +1108,14 @@ impl Page {
                 return Command::none();
             }
 
-            Message::ExperimentalContextDrawer => {
-                self.context_view = Some(ContextView::Experimental);
+            Message::IconsAndToolkit => {
+                self.context_view = Some(ContextView::IconsAndToolkit);
                 return cosmic::command::message(crate::app::Message::OpenContextDrawer("".into()));
             }
 
             Message::Daytime(day_time) => {
                 self.day_time = day_time;
                 return Command::none();
-            }
-
-            Message::FontConfig(message) => {
-                return self.font_config.update(message);
             }
         }
 
@@ -1353,7 +1426,6 @@ impl page::Page<crate::pages::Message> for Page {
             sections.insert(mode_and_colors()),
             sections.insert(style()),
             sections.insert(interface_density()),
-            sections.insert(font_config::section()),
             sections.insert(window_management()),
             sections.insert(experimental()),
             sections.insert(reset_button()),
@@ -1387,7 +1459,7 @@ impl page::Page<crate::pages::Message> for Page {
     ) -> Command<crate::pages::Message> {
         command::batch(vec![
             // Load icon themes
-            command::future(fetch_icon_themes()).map(crate::pages::Message::Appearance),
+            command::future(icon_themes::fetch()).map(crate::pages::Message::Appearance),
             // Load font families
             command::future(async move {
                 let (mono, interface) = font_config::load_font_families();
@@ -1443,8 +1515,6 @@ impl page::Page<crate::pages::Message> for Page {
             )
             .map(crate::pages::Message::Appearance),
 
-            ContextView::Experimental => self.experimental_context_view(),
-
             ContextView::InterfaceText => color_picker_context_view(
                 None,
                 RESET_TO_DEFAULT.as_str().into(),
@@ -1452,6 +1522,32 @@ impl page::Page<crate::pages::Message> for Page {
                 &self.interface_text,
             )
             .map(crate::pages::Message::Appearance),
+
+            ContextView::SystemFont => {
+                let filter = if self.font_search.is_empty() {
+                    &self.font_config.interface_font_families
+                } else {
+                    &self.font_filter
+                };
+                let current_font = cosmic::config::interface_font().family.as_str();
+
+                font_config::selection_context(filter, &self.font_search, current_font, true)
+                    .map(crate::pages::Message::Appearance)
+            }
+
+            ContextView::MonospaceFont => {
+                let filter = if self.font_search.is_empty() {
+                    &self.font_config.monospace_font_families
+                } else {
+                    &self.font_filter
+                };
+                let current_font = cosmic::config::monospace_font().family.as_str();
+
+                font_config::selection_context(filter, &self.font_search, current_font, false)
+                    .map(crate::pages::Message::Appearance)
+            }
+
+            ContextView::IconsAndToolkit => self.icons_and_toolkit(),
         };
 
         Some(view)
@@ -1485,6 +1581,10 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
         .title(fl!("mode-and-colors"))
         .descriptions(descriptions)
         .view::<Page>(move |_binder, page, section| {
+            let Spacing {
+                space_xxs, space_s, ..
+            } = cosmic::theme::active().cosmic().spacing;
+
             let descriptions = &section.descriptions;
             let palette = &page.theme_builder.palette.as_ref();
             let cur_accent = page
@@ -1508,7 +1608,7 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
                                 .on_press(Message::DarkMode(true)),
                                 text::body(&descriptions[dark])
                             ]
-                            .spacing(8)
+                            .spacing(space_xxs)
                             .width(Length::FillPortion(1))
                             .align_items(cosmic::iced_core::Alignment::Center),
                             cosmic::iced::widget::column![
@@ -1523,11 +1623,11 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
                                 .on_press(Message::DarkMode(false)),
                                 text::body(&descriptions[light])
                             ]
-                            .spacing(8)
+                            .spacing(space_xxs)
                             .width(Length::FillPortion(1))
                             .align_items(cosmic::iced_core::Alignment::Center)
                         ]
-                        .spacing(48)
+                        .spacing(48) // TODO: dynamic spacing based on window width
                         .align_items(cosmic::iced_core::Alignment::Center)
                         .width(Length::Fixed(424.0)),
                     )
@@ -1644,8 +1744,8 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
                             scrollable::Properties::new()
                         ))
                     ]
-                    .padding([16, 24, 0, 24])
-                    .spacing(8),
+                    .padding([16, space_s, 0, space_s])
+                    .spacing(space_xxs),
                 )
                 .add(
                     settings::item::builder(&descriptions[app_bg]).control(
@@ -1836,7 +1936,7 @@ pub fn interface_density() -> Section<crate::pages::Message> {
     Section::default()
         .title(fl!("interface-density"))
         .descriptions(descriptions)
-        .view::<Page>(move |_binder, page, section| {
+        .view::<Page>(move |_binder, _page, section| {
             let descriptions = &section.descriptions;
 
             let density = cosmic::config::interface_density();
@@ -1905,30 +2005,40 @@ pub fn window_management() -> Section<crate::pages::Message> {
 }
 
 pub fn experimental() -> Section<crate::pages::Message> {
-    let mut descriptions = Slab::new();
-
-    let experimental_label = descriptions.insert(fl!("experimental-settings"));
+    crate::slab!(descriptions {
+        interface_font_txt = fl!("interface-font");
+        monospace_font_txt = fl!("monospace-font");
+        icons_and_toolkit_txt = fl!("icons-and-toolkit");
+    });
 
     Section::default()
+        .title(fl!("experimental-settings"))
         .descriptions(descriptions)
         .view::<Page>(move |_binder, _page, section| {
             let descriptions = &section.descriptions;
 
-            let control = row::with_children(vec![
-                horizontal_space(Length::Fill).into(),
-                icon::from_name("go-next-symbolic").size(16).into(),
-            ]);
+            let system_font = crate::widget::go_next_with_item(
+                &descriptions[interface_font_txt],
+                text::body(cosmic::config::interface_font().family.as_str()),
+                Message::DisplaySystemFont,
+            );
+
+            let mono_font = crate::widget::go_next_with_item(
+                &descriptions[monospace_font_txt],
+                text::body(cosmic::config::monospace_font().family.as_str()),
+                Message::DisplayMonoFont,
+            );
+
+            let icons_and_toolkit = crate::widget::go_next_item(
+                &descriptions[icons_and_toolkit_txt],
+                Message::IconsAndToolkit,
+            );
 
             settings::section()
-                .add(
-                    settings::item::builder(&descriptions[experimental_label])
-                        .control(control)
-                        .apply(container)
-                        .style(cosmic::theme::Container::List)
-                        .apply(button::custom)
-                        .style(cosmic::theme::Button::Transparent)
-                        .on_press(Message::ExperimentalContextDrawer),
-                )
+                .title(&*section.title)
+                .add(system_font)
+                .add(mono_font)
+                .add(icons_and_toolkit)
                 .apply(Element::from)
                 .map(crate::pages::Message::Appearance)
         })
